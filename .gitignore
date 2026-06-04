@@ -1,0 +1,13 @@
+# 實驗結果
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 環境變數
+.env
+
+# Mac
+.DS_Store
