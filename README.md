@@ -1,120 +1,157 @@
-# HumanEval-Decompile-cpp — Usage Guide
+# cfg-guided-decompiler
 
-## 1. Dataset Overview
+Token-efficient LLM-based C++ decompilation augmented with Control Flow Graph (CFG) information extracted via Ghidra.
 
-The HumanEval-Decompile-cpp dataset contains 656 records (164 unique C++ functions x 4 optimization levels: O0/O1/O2/O3). Each record includes the original C++ source, x86-64 assembly, Ghidra pseudocode, and unit tests for evaluating decompilation quality.
-
-**Dataset file:**
-```
-humaneval_decompile_guide/HumanEval-Decompile-cpp.jsonl
-```
-
-### Fields per record
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `index` | int | Unique ID (0–655) |
-| `func_name` | str | Function name (e.g., `func0`) |
-| `opt` | str | Optimization level: `O0`, `O1`, `O2`, `O3` |
-| `language` | str | Always `"cpp"` |
-| `asm` | str | x86-64 assembly (objdump format) |
-| `ghidra_asm` | str | Ghidra-format assembly (uppercase mnemonics) |
-| `ghidra_pseudo` | str | Ghidra decompiler pseudocode |
-| `func_dep` | str | C++ includes/dependencies needed to compile |
-| `test` | str | Unit test code with assertions |
-| `func` | str | Original C++ source code |
+This project implements and evaluates three decompilation prompting strategies — **Base**, **DOT**, and **LTA** — on the [HumanEval-Decompile-cpp](https://huggingface.co/datasets/LLM4Binary/HumanEval-Decompile) benchmark, using McNemar's test to assess statistical significance of differences.
 
 ---
 
-## 2. Loading the Dataset
+## Overview
 
-### Minimal loading (standard library only)
+Standard LLM decompilation prompts only provide raw assembly. This project investigates whether supplying structured CFG information as auxiliary context improves decompilation quality, and whether a token-efficient linearized format (LTA) can match or exceed the richer DOT graph format.
 
-```python
-import json
+### Prompting modes
 
-def iter_jsonl(path):
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
+| Mode | CFG input | Description |
+|------|-----------|-------------|
+| **Base** | None | Assembly only |
+| **DOT** | DOT graph | Full CFG in Graphviz DOT format |
+| **LTA** | LTA format | Linearized Tagged Assembly — a token-efficient CFG representation |
 
-DATASET = "humaneval_decompile_guide/HumanEval-Decompile-cpp.jsonl"
+### LTA format
 
-for rec in iter_jsonl(DATASET):
-    print(rec["index"], rec["func_name"], rec["opt"])
+LTA (Linearized Tagged Assembly) represents CFG structure as plain text:
+
 ```
+[BLOCK: 0x401a20]
+  push rbp
+  mov rbp, rsp
+  -> FALL_THROUGH: 0x401a24
 
-### Index by record ID
-
-```python
-import json
-
-def iter_jsonl(path):
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
-
-DATASET = "humaneval_decompile_guide/HumanEval-Decompile-cpp.jsonl"
-
-data_by_idx = {}
-for rec in iter_jsonl(DATASET):
-    data_by_idx[rec["index"]] = rec
-
-rec = data_by_idx[0]  # func0, O0
-print(rec["func"])           # Original C++ source
-print(rec["asm"])            # Assembly
-print(rec["ghidra_pseudo"])  # Ghidra pseudocode
+[BLOCK: 0x401a24]
+  cmp eax, 0
+  -> CONDITIONAL_JUMP: 0x401a40
+  -> FALL_THROUGH: 0x401a28
 ```
-
-See also: `humaneval_decompile_guide/load_dataset.py` for a self-contained demo script.
 
 ---
 
-## 3. Evaluating Decompilation Results
+## Requirements
 
-### What you need
-
-Your decompilation model should produce an `outputs.jsonl` file where each line contains:
-
-```json
-{
-    "index": 0,
-    "opt_level": "O0",
-    "refined_code": "bool func0(vector<float> numbers, float threshold) { ... }"
-}
-```
-
-- `index` must match the dataset record index
-- `refined_code` is the decompiled C++ code (can be wrapped in markdown code blocks)
-
-### Metrics
-
-| Metric | What it measures |
-|--------|-----------------|
-| **R_exec** | Functional correctness — decompiled code compiles AND passes all unit tests |
-| **R_comp** | Compilation success rate — decompiled code compiles with `g++ -std=c++17 -O0` |
-
-### Running evaluation
+- Python 3.10+
+- [Ghidra](https://ghidra-sre.org/) (headless mode; set `$GHIDRA_HEADLESS` env var)
+- `g++` with C++17 support
+- For Gemini backend: Google Vertex AI credentials
+- For local model backend: [vLLM](https://github.com/vllm-project/vllm) serving `LLM4Binary/llm4decompile-9b-v2`
+- Python dependencies:
 
 ```bash
-python3 humaneval_decompile_guide/evaluate.py \
-    --outputs /path/to/outputs.jsonl
+pip install tqdm statsmodels google-cloud-aiplatform openai
 ```
 
-**Outputs:**
-- `per_sample.jsonl` — per-record metrics (R_comp, R_exec, compile_error)
-- `summary.csv` — aggregate metrics (overall + per optimization level R_exec)
+---
 
-### Evaluation details
+## Pipeline
 
-The evaluation pipeline for each record:
-1. Extracts C++ code from LLM output (strips markdown code blocks if present)
-2. Combines `func_dep` (includes) + `refined_code` + `test` (unit tests) into a single `.cpp` file
-3. Compiles with `g++ -std=c++17 -O0` (timeout: 30s) — **R_comp**
-4. Runs the compiled binary (timeout: 60s), checks exit code == 0 — **R_exec**
+### Step 1 — Compile dataset sources to object files
 
-See also: `humaneval_decompile_guide/evaluate.py` for the standalone evaluation script.
+```bash
+python compile_source.py
+```
+
+Reads a `.jsonl` dataset, compiles each C++ function at its specified optimization level (`O0`–`O3`), and saves `.o` files to `compiled_objects/`.
+
+### Step 2 — Extract CFG via Ghidra (batch)
+
+```bash
+export GHIDRA_HEADLESS=/path/to/ghidra/support/analyzeHeadless
+python batch_run_ghidra.py
+```
+
+Runs Ghidra headless on each `.o` file and invokes `export_cfg_lta.py` (or `extract_cfg_headless.py` for DOT output) to extract per-function CFG files into `cfg_outputs/`.
+
+### Step 3 — (Optional) Convert DOT → LTA
+
+```bash
+python generate_lta_from_dot.py
+```
+
+Converts DOT-format CFGs embedded in the dataset into LTA format, writing a new `*-LTA.jsonl` dataset file.
+
+### Step 4 — Run ablation study
+
+**Gemini (Vertex AI) backend:**
+```bash
+python llm_decompile_ablation.py
+```
+
+**Local vLLM backend (llm4decompile-9b-v2):**
+```bash
+python llm_decompile_ablation_l4.py
+```
+
+Outputs one `ablation_results/outputs_{mode}.jsonl` per mode.
+
+### Step 5 — Evaluate results
+
+```bash
+bash run_eval.sh
+```
+
+Or manually:
+```bash
+python evaluate_reveal.py \
+    --dataset test-cpp-LTA.jsonl \
+    --outputs ablation_results/outputs_lta.jsonl
+```
+
+Reports **R_comp** (compilation rate) and **R_exec** (functional correctness), broken down by optimization level. Extracted C++ files are saved to `reveal_results/` for manual inspection.
+
+Full evaluation against the original HumanEval-Decompile-cpp benchmark:
+```bash
+python evaluate.py --outputs ablation_results/outputs_lta.jsonl
+```
+
+### Step 6 — Statistical significance (McNemar's test)
+
+```bash
+bash run_mcnemar.sh
+```
+
+Runs pairwise McNemar's tests across all three modes (Base vs DOT, Base vs LTA, DOT vs LTA).
+
+---
+
+## Output structure
+
+```
+ablation_results/
+    outputs_base.jsonl
+    outputs_dot.jsonl
+    outputs_lta.jsonl
+reveal_results/
+    base/   # extracted .cpp files per sample
+    dot/
+    lta/
+cfg_outputs/
+    record_0_O0_func0.lta
+    ...
+compiled_objects/
+    record_0_O0.o
+    ...
+```
+
+---
+
+## Evaluation metrics
+
+| Metric | Definition |
+|--------|-----------|
+| **R_comp** | Decompiled code compiles with `g++ -std=c++17 -O0` |
+| **R_exec** | Compiled binary passes all unit tests (exit code 0) |
+
+---
+
+## Dataset
+
+Built on [HumanEval-Decompile-cpp](https://huggingface.co/datasets/LLM4Binary/HumanEval-Decompile): 164 unique C++ functions × 4 optimization levels = 656 records. Each record includes original source, x86-64 assembly, Ghidra pseudocode, and unit tests.
